@@ -25,6 +25,7 @@ g_trend = "Trend Engine (ADX/DI)"
 g_flow  = "Flow Engine (Nadaraya-Watson)"
 g_liq   = "Liquidity Levels"
 g_bias  = "Bias Thresholds"
+g_tpsl  = "TP / SL"
 g_app   = "Appearance"
 
 adx_len = input.int(14, "ADX & DI Length", minval = 1, group = g_trend)
@@ -48,6 +49,10 @@ show_labels  = input.bool(true, "Price Labels on Active Levels", group = g_liq)
 bias_build = input.float(0.2,  "ADX Impulse: Building Threshold", step = 0.05, group = g_bias)
 bias_fade  = input.float(-0.3, "ADX Impulse: Fading Threshold", step = 0.05, group = g_bias)
 bias_hold  = input.int(3, "Background Debounce (bars)", minval = 1, maxval = 20, group = g_bias, tooltip = "The bias background only paints after the bias has held this many consecutive bars. Alerts still fire on the raw flip.")
+
+show_tpsl = input.bool(true, "Show TP/SL on Bias Activation", group = g_tpsl, tooltip = "When a LONG or SHORT bias activates, plots entry, stop-loss and take-profit levels on the price chart and tracks them until TP is hit, SL is hit, the bias deactivates, or a new bias replaces the setup. Visual guide only — not an order manager.")
+sl_atr_mult = input.float(2.0, "Stop Loss (ATR multiples)", minval = 0.1, step = 0.1, group = g_tpsl, tooltip = "Stop distance from entry, in smoothed-ATR multiples. Risk (1R) = this distance.")
+tp_rr       = input.float(2.0, "Take Profit (R multiple)", minval = 0.1, step = 0.1, group = g_tpsl, tooltip = "Target distance as a multiple of the stop distance (risk:reward).")
 
 show_band_candles  = input.bool(false, "Show NW Band Candles", group = g_app, tooltip = "Off by default in clean mode — the recolored price candles already carry the same colour information.")
 show_price_candles = input.bool(true, "Show Recolored Price Candles", group = g_app)
@@ -291,6 +296,84 @@ short_run := short_active ? short_run + 1 : 0
 
 bgcolor(long_run >= bias_hold ? bullBg : short_run >= bias_hold ? bearBg : na)
 
+// ── TP/SL engine: one setup at a time, born on a bias flip ─
+long_flip  = long_active and not long_active[1]
+short_flip = short_active and not short_active[1]
+
+var int   trade_dir   = 0
+var float entry_price = na
+var float sl_price    = na
+var float tp_price    = na
+var line  entry_ln    = na
+var line  sl_ln       = na
+var line  tp_ln       = na
+var label entry_lb    = na
+var label sl_lb       = na
+var label tp_lb       = na
+
+tp_hit          = false
+sl_hit          = false
+setup_cancelled = false
+
+// 1) Manage the live setup (evaluated before any new flip can replace it)
+if trade_dir != 0
+    line.set_x2(entry_ln, bar_index)
+    line.set_x2(sl_ln, bar_index)
+    line.set_x2(tp_ln, bar_index)
+    label.set_x(entry_lb, bar_index)
+    label.set_x(sl_lb, bar_index)
+    label.set_x(tp_lb, bar_index)
+
+    if trade_dir == 1
+        if low <= sl_price
+            sl_hit := true
+        else if high >= tp_price
+            tp_hit := true
+        else if not long_active
+            setup_cancelled := true
+    else
+        if high >= sl_price
+            sl_hit := true
+        else if low <= tp_price
+            tp_hit := true
+        else if not short_active
+            setup_cancelled := true
+
+// 2) Retire the setup on resolution or replacement
+if trade_dir != 0 and (tp_hit or sl_hit or setup_cancelled or long_flip or short_flip)
+    line.set_style(entry_ln, line.style_dotted)
+    line.set_style(sl_ln, line.style_dotted)
+    line.set_style(tp_ln, line.style_dotted)
+    line.set_color(entry_ln, color.new(chart.fg_color, 85))
+    line.set_color(sl_ln, color.new(red, sl_hit ? 60 : 85))
+    line.set_color(tp_ln, color.new(green, tp_hit ? 60 : 85))
+    array.push(dead_lines, entry_ln)
+    array.push(dead_since, bar_index)
+    array.push(dead_lines, sl_ln)
+    array.push(dead_since, bar_index)
+    array.push(dead_lines, tp_ln)
+    array.push(dead_since, bar_index)
+    label.delete(entry_lb)
+    label.delete(sl_lb)
+    label.delete(tp_lb)
+    trade_dir := 0
+
+// 3) Open a new setup on a fresh bias flip
+if show_tpsl and (long_flip or short_flip) and not na(volatility) and volatility > 0
+    trade_dir   := long_flip ? 1 : -1
+    entry_price := close
+    float risk = sl_atr_mult * volatility
+    sl_price := long_flip ? close - risk : close + risk
+    tp_price := long_flip ? close + risk * tp_rr : close - risk * tp_rr
+
+    entry_ln := line.new(bar_index, entry_price, bar_index, entry_price, xloc = xloc.bar_index, color = color.new(chart.fg_color, 40), style = line.style_dotted, width = 1, force_overlay = true)
+    sl_ln    := line.new(bar_index, sl_price, bar_index, sl_price, xloc = xloc.bar_index, color = red, width = 2, force_overlay = true)
+    tp_ln    := line.new(bar_index, tp_price, bar_index, tp_price, xloc = xloc.bar_index, color = green, width = 2, force_overlay = true)
+
+    entry_lb := label.new(bar_index, entry_price, (long_flip ? "LONG @ " : "SHORT @ ") + str.tostring(entry_price, format.mintick), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(chart.fg_color, 90), textcolor = color.new(chart.fg_color, 20), size = size.tiny, force_overlay = true)
+    sl_lb    := label.new(bar_index, sl_price, "SL " + str.tostring(sl_price, format.mintick) + "  (-1R)", xloc = xloc.bar_index, style = label.style_label_left, color = color.new(red, 85), textcolor = red, size = size.tiny, force_overlay = true)
+    tp_lb    := label.new(bar_index, tp_price, "TP " + str.tostring(tp_price, format.mintick) + "  (+" + str.tostring(tp_rr, "#.#") + "R)", xloc = xloc.bar_index, style = label.style_label_left, color = color.new(green, 85), textcolor = green, size = size.tiny, force_overlay = true)
+
 // ── Pane plots (flow oscillator) ─────────────────────────
 main = plot(osc, "Oscillator", color.blue, 2, display = display.none)
 plot(signal, "Signal Line", show_signal_line ? color.new(chart.fg_color, 50) : na)
@@ -333,7 +416,7 @@ plotchar(show_rebounds and bullish_rebound ? nw_val - volatility * 1.5 : na, "Bu
 plotchar(show_rebounds and bearish_rebound ? nw_val + volatility * 1.5 : na, "Bearish Rebound", "▼", location.absolute, red, size = size.tiny, force_overlay = true)
 
 // ── VN Edge table ────────────────────────────────────────
-var table t = table.new(table_pos, 2, 8, bgcolor = color.new(color.black, 80), border_width = 1)
+var table t = table.new(table_pos, 2, 9, bgcolor = color.new(color.black, 80), border_width = 1)
 
 if show_table and barstate.islast
     table.clear(t, 0, 0)
@@ -371,6 +454,13 @@ if show_table and barstate.islast
     table.cell(t, 1, 7, str.tostring(array.size(up_lines)) + " / " + str.tostring(array.size(dn_lines)),
          text_color = neutral_txt, text_size = text_size)
 
+    table.cell(t, 0, 8, "Setup", text_color = neutral_txt, text_size = text_size)
+    table.cell(t, 1, 8, trade_dir == 0 ? "—" :
+         (trade_dir == 1 ? "L " : "S ") + str.tostring(entry_price, format.mintick) +
+         " | TP " + str.tostring(tp_price, format.mintick) +
+         " | SL " + str.tostring(sl_price, format.mintick),
+         text_color = trade_dir == 1 ? bull_txt : trade_dir == -1 ? bear_txt : neutral_txt, text_size = text_size)
+
 // ── Alerts ───────────────────────────────────────────────
 alertcondition(long_active and not long_active[1],   "VN Edge: LONG Bias On",   "VN Edge | LONG bias active (DI+flow confluence, ADX above trigger) on {{ticker}} {{interval}}")
 alertcondition(short_active and not short_active[1], "VN Edge: SHORT Bias On",  "VN Edge | SHORT bias active (DI+flow confluence, ADX above trigger) on {{ticker}} {{interval}}")
@@ -392,3 +482,7 @@ alertcondition(upper_wick_sweep,  "Upper Level WICK Sweep",  "VN Edge | Upper le
 alertcondition(lower_wick_sweep,  "Lower Level WICK Sweep",  "VN Edge | Lower level swept by wick (liquidity grab) on {{ticker}} {{interval}}")
 alertcondition(upper_close_break, "Upper Level CLOSE Break", "VN Edge | Upper level broken by close (breakout) on {{ticker}} {{interval}}")
 alertcondition(lower_close_break, "Lower Level CLOSE Break", "VN Edge | Lower level broken by close (breakout) on {{ticker}} {{interval}}")
+
+alertcondition(tp_hit, "TP Hit", "VN Edge | Take-profit reached on {{ticker}} {{interval}}")
+alertcondition(sl_hit, "SL Hit", "VN Edge | Stop-loss hit on {{ticker}} {{interval}}")
+alertcondition(setup_cancelled, "TP/SL Setup Cancelled", "VN Edge | Setup cancelled — bias deactivated before TP/SL on {{ticker}} {{interval}}")
