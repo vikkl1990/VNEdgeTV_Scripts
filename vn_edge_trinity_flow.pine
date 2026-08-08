@@ -304,11 +304,12 @@ col_ = osc > 0 ?
 fill(main, ovf, col_, "Oscillator Gradient")
 fill(zero, ovf, osc > 0 ? green : red, "Overflow Fill")
 
-// Hidden data plots (data window / external alerts)
-plot(diPlus,  "+DI", display = display.none)
-plot(diMinus, "-DI", display = display.none)
-plot(adx,     "ADX", display = display.none)
-plot(score,   "VN Edge Score", display = display.none)
+// Inspection-only plots: visible in the data window, never drawn in the pane
+// (drawing them would rescale the pane to 0-60 and flatten the flow oscillator)
+plot(diPlus,  "+DI", color.new(color.blue, 100), display = display.data_window)
+plot(diMinus, "-DI", color.new(color.blue, 100), display = display.data_window)
+plot(adx,     "ADX", color.new(color.blue, 100), display = display.data_window)
+plot(score,   "VN Edge Score", color.new(color.blue, 100), display = display.data_window)
 
 // ── Price-pane overlays ──────────────────────────────────
 plotcandle(
