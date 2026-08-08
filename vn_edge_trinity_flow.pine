@@ -53,6 +53,8 @@ bias_hold  = input.int(3, "Background Debounce (bars)", minval = 1, maxval = 20,
 show_tpsl = input.bool(true, "Show TP/SL on Bias Activation", group = g_tpsl, tooltip = "When a LONG or SHORT bias activates, plots entry, stop-loss and take-profit levels on the price chart and tracks them until TP is hit, SL is hit, the bias deactivates, or a new bias replaces the setup. Visual guide only — not an order manager.")
 sl_atr_mult = input.float(2.0, "Stop Loss (ATR multiples)", minval = 0.1, step = 0.1, group = g_tpsl, tooltip = "Stop distance from entry, in smoothed-ATR multiples. Risk (1R) = this distance.")
 tp_rr       = input.float(2.0, "Take Profit (R multiple)", minval = 0.1, step = 0.1, group = g_tpsl, tooltip = "Target distance as a multiple of the stop distance (risk:reward).")
+show_stats  = input.bool(true, "Show WR / PF Stats", group = g_tpsl, tooltip = "Scores every resolved setup in R over the loaded chart history — TP, SL, and cancelled setups all count, net of fees. In-sample eyeball statistics, not a governed backtest.")
+fee_pct     = input.float(0.05, "Fee per Side (%)", minval = 0, step = 0.01, group = g_tpsl, tooltip = "Taker fee per side as a percent of notional (e.g. 0.05 = 0.05%). Both entry and exit fees are converted to R and subtracted from each setup's result. On tight 5m stops fees eat a large share of R — that is the point of showing net.")
 
 show_band_candles  = input.bool(false, "Show NW Band Candles", group = g_app, tooltip = "Off by default in clean mode — the recolored price candles already carry the same colour information.")
 show_price_candles = input.bool(true, "Show Recolored Price Candles", group = g_app)
@@ -304,6 +306,7 @@ var int   trade_dir   = 0
 var float entry_price = na
 var float sl_price    = na
 var float tp_price    = na
+var float risk_1r     = na
 var line  entry_ln    = na
 var line  sl_ln       = na
 var line  tp_ln       = na
@@ -314,6 +317,15 @@ var label tp_lb       = na
 tp_hit          = false
 sl_hit          = false
 setup_cancelled = false
+
+// Setup scoreboard (accumulated over loaded chart history, in net R)
+var int   n_tp         = 0
+var int   n_sl         = 0
+var int   n_cxl        = 0
+var int   n_win        = 0
+var float gross_win_r  = 0.0
+var float gross_loss_r = 0.0
+var float net_r        = 0.0
 
 // 1) Manage the live setup (evaluated before any new flip can replace it)
 if trade_dir != 0
@@ -341,6 +353,21 @@ if trade_dir != 0
 
 // 2) Retire the setup on resolution or replacement
 if trade_dir != 0 and (tp_hit or sl_hit or setup_cancelled or long_flip or short_flip)
+    // Score the setup in R, net of both-side fees (cancel/replace exits at close)
+    float exit_price = tp_hit ? tp_price : sl_hit ? sl_price : close
+    float r_gross    = trade_dir * (exit_price - entry_price) / risk_1r
+    float fee_r      = fee_pct / 100 * (entry_price + exit_price) / risk_1r
+    float r_net      = r_gross - fee_r
+    net_r += r_net
+    if r_net > 0
+        n_win += 1
+        gross_win_r += r_net
+    else
+        gross_loss_r += -r_net
+    n_tp  += tp_hit ? 1 : 0
+    n_sl  += sl_hit ? 1 : 0
+    n_cxl += tp_hit or sl_hit ? 0 : 1
+
     line.set_style(entry_ln, line.style_dotted)
     line.set_style(sl_ln, line.style_dotted)
     line.set_style(tp_ln, line.style_dotted)
@@ -363,6 +390,7 @@ if show_tpsl and (long_flip or short_flip) and not na(volatility) and volatility
     trade_dir   := long_flip ? 1 : -1
     entry_price := close
     float risk = sl_atr_mult * volatility
+    risk_1r  := risk
     sl_price := long_flip ? close - risk : close + risk
     tp_price := long_flip ? close + risk * tp_rr : close - risk * tp_rr
 
@@ -416,7 +444,7 @@ plotchar(show_rebounds and bullish_rebound ? nw_val - volatility * 1.5 : na, "Bu
 plotchar(show_rebounds and bearish_rebound ? nw_val + volatility * 1.5 : na, "Bearish Rebound", "▼", location.absolute, red, size = size.tiny, force_overlay = true)
 
 // ── VN Edge table ────────────────────────────────────────
-var table t = table.new(table_pos, 2, 9, bgcolor = color.new(color.black, 80), border_width = 1)
+var table t = table.new(table_pos, 2, 12, bgcolor = color.new(color.black, 80), border_width = 1)
 
 if show_table and barstate.islast
     table.clear(t, 0, 0)
@@ -460,6 +488,25 @@ if show_table and barstate.islast
          " | TP " + str.tostring(tp_price, format.mintick) +
          " | SL " + str.tostring(sl_price, format.mintick),
          text_color = trade_dir == 1 ? bull_txt : trade_dir == -1 ? bear_txt : neutral_txt, text_size = text_size)
+
+    if show_stats
+        int   n_closed = n_tp + n_sl + n_cxl
+        float wr       = n_closed > 0 ? 100.0 * n_win / n_closed : na
+        float pf       = gross_loss_r > 0 ? gross_win_r / gross_loss_r : na
+
+        table.cell(t, 0, 9, "TP / SL / Cxl", text_color = neutral_txt, text_size = text_size)
+        table.cell(t, 1, 9, str.tostring(n_tp) + " / " + str.tostring(n_sl) + " / " + str.tostring(n_cxl),
+             text_color = neutral_txt, text_size = text_size)
+
+        table.cell(t, 0, 10, "WR / PF (net)", text_color = neutral_txt, text_size = text_size)
+        table.cell(t, 1, 10,
+             (na(wr) ? "—" : str.tostring(wr, "#") + "%") + " / " +
+             (na(pf) ? (gross_win_r > 0 ? "∞" : "—") : str.tostring(pf, "#.##")),
+             text_color = na(pf) ? neutral_txt : pf >= 1 ? bull_txt : bear_txt, text_size = text_size)
+
+        table.cell(t, 0, 11, "Net R", text_color = neutral_txt, text_size = text_size)
+        table.cell(t, 1, 11, (net_r >= 0 ? "+" : "") + str.tostring(net_r, "#.#") + "R",
+             text_color = net_r > 0 ? bull_txt : net_r < 0 ? bear_txt : neutral_txt, text_size = text_size)
 
 // ── Alerts ───────────────────────────────────────────────
 alertcondition(long_active and not long_active[1],   "VN Edge: LONG Bias On",   "VN Edge | LONG bias active (DI+flow confluence, ADX above trigger) on {{ticker}} {{interval}}")
