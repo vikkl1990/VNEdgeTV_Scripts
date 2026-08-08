@@ -11,8 +11,14 @@
 //   * Sweep semantics split: WICK SWEEP (liquidity grab) vs CLOSE BREAK (breakout) — separate alerts
 //   * Rebound signals compare close[1] to nw_val[1] (a real cross, not a curve drift)
 //   * Combined VN EDGE BIAS: DI direction + flow sign + flow-vs-signal confluence, graded by ADX tier
+// Clean-mode pass:
+//   * One candle layer by default (band candles off; both still toggleable)
+//   * Retired/evicted level lines fade immediately and are deleted after a configurable age
+//   * Active levels carry a small price label at their right edge; labels die with the level
+//   * Background bias tint is debounced (must hold N bars) so chop doesn't strobe the pane
+//   * Table colors derive from the two brand colour inputs instead of hardcoded lime/red/yellow
 //@version=6
-indicator("VN Edge — Trinity Flow", "VN Edge", overlay = false, max_lines_count = 500)
+indicator("VN Edge — Trinity Flow", "VN Edge", overlay = false, max_lines_count = 500, max_labels_count = 100)
 
 // ── Inputs ───────────────────────────────────────────────
 g_trend = "Trend Engine (ADX/DI)"
@@ -33,13 +39,16 @@ signal_len     = input.int(14,  "Signal Length (EMA)", minval = 1, group = g_flo
 atr_len        = input.int(14,  "ATR Length", minval = 1, group = g_flow)
 vol_smooth_len = input.int(21,  "Volatility Smoothing", minval = 1, group = g_flow)
 
-use_tip    = input.bool(true, "Anchor Levels to Swing Points", group = g_liq)
-max_levels = input.int(8, "Max Tracked Levels per Side", minval = 1, maxval = 50, group = g_liq)
+use_tip      = input.bool(true, "Anchor Levels to Swing Points", group = g_liq)
+max_levels   = input.int(8, "Max Tracked Levels per Side", minval = 1, maxval = 50, group = g_liq)
+retire_after = input.int(60, "Delete Retired Levels After (bars, 0 = keep)", minval = 0, group = g_liq, tooltip = "A level broken by a close (or evicted by the cap) fades immediately and is deleted this many bars later, so old lines stop striping the chart. 0 keeps faded lines forever.")
+show_labels  = input.bool(true, "Price Labels on Active Levels", group = g_liq)
 
 bias_build = input.float(0.2,  "ADX Impulse: Building Threshold", step = 0.05, group = g_bias)
 bias_fade  = input.float(-0.3, "ADX Impulse: Fading Threshold", step = 0.05, group = g_bias)
+bias_hold  = input.int(3, "Background Debounce (bars)", minval = 1, maxval = 20, group = g_bias, tooltip = "The bias background only paints after the bias has held this many consecutive bars. Alerts still fire on the raw flip.")
 
-show_band_candles  = input.bool(true, "Show NW Band Candles", group = g_app)
+show_band_candles  = input.bool(false, "Show NW Band Candles", group = g_app, tooltip = "Off by default in clean mode — the recolored price candles already carry the same colour information.")
 show_price_candles = input.bool(true, "Show Recolored Price Candles", group = g_app)
 show_signal_line   = input.bool(true, "Show Oscillator Signal Line", group = g_app)
 show_momentum_dots = input.bool(true, "Show Momentum Weakening Dots", group = g_app)
@@ -66,6 +75,12 @@ table_pos = switch table_pos_str
     "Bottom Right" => position.bottom_right
     "Middle Left"  => position.middle_left
     => position.middle_right
+
+// Brand-derived table palette
+bull_txt    = green
+bear_txt    = red
+neutral_txt = color.new(chart.fg_color, 25)
+warn_txt    = color.orange
 
 // ── Trend engine: ADX/DI (seeded Wilder via ta.dmi) ──────
 [diPlus, diMinus, adx] = ta.dmi(adx_len, adx_len)
@@ -138,9 +153,21 @@ new_lower_level = osc < 0 and flow_cross_up
 var array<line>  up_lines  = array.new<line>()
 var array<float> up_prices = array.new<float>()
 var array<bool>  up_swept  = array.new<bool>()
+var array<label> up_labels = array.new<label>()
 var array<line>  dn_lines  = array.new<line>()
 var array<float> dn_prices = array.new<float>()
 var array<bool>  dn_swept  = array.new<bool>()
+var array<label> dn_labels = array.new<label>()
+
+// Retired lines awaiting cleanup: [line, retirement bar]
+var array<line> dead_lines = array.new<line>()
+var array<int>  dead_since = array.new<int>()
+
+retire_line(line ln, color fade_col) =>
+    line.set_style(ln, line.style_dotted)
+    line.set_color(ln, fade_col)
+    array.push(dead_lines, ln)
+    array.push(dead_since, bar_index)
 
 upper_wick_sweep  = false
 upper_close_break = false
@@ -154,11 +181,12 @@ if array.size(up_lines) > 0
         line.set_x2(ln, bar_index)
         if close > p
             upper_close_break := true
-            line.set_style(ln, line.style_dotted)
-            line.set_color(ln, color.new(red, 75))
+            retire_line(ln, color.new(red, 80))
+            label.delete(array.get(up_labels, i))
             array.remove(up_lines, i)
             array.remove(up_prices, i)
             array.remove(up_swept, i)
+            array.remove(up_labels, i)
         else if high > p and not array.get(up_swept, i)
             upper_wick_sweep := true
             array.set(up_swept, i, true)
@@ -171,15 +199,32 @@ if array.size(dn_lines) > 0
         line.set_x2(ln, bar_index)
         if close < p
             lower_close_break := true
-            line.set_style(ln, line.style_dotted)
-            line.set_color(ln, color.new(green, 75))
+            retire_line(ln, color.new(green, 80))
+            label.delete(array.get(dn_labels, i))
             array.remove(dn_lines, i)
             array.remove(dn_prices, i)
             array.remove(dn_swept, i)
+            array.remove(dn_labels, i)
         else if low < p and not array.get(dn_swept, i)
             lower_wick_sweep := true
             array.set(dn_swept, i, true)
             line.set_style(ln, line.style_dashed)
+
+// Keep active labels pinned to the right edge of their level
+if show_labels
+    if array.size(up_labels) > 0
+        for i = 0 to array.size(up_labels) - 1
+            label.set_x(array.get(up_labels, i), bar_index)
+    if array.size(dn_labels) > 0
+        for i = 0 to array.size(dn_labels) - 1
+            label.set_x(array.get(dn_labels, i), bar_index)
+
+mk_label(float lvl, color c) =>
+    show_labels ?
+         label.new(bar_index, lvl, str.tostring(lvl, format.mintick),
+             xloc = xloc.bar_index, style = label.style_label_left,
+             color = color.new(c, 85), textcolor = c, size = size.tiny,
+             force_overlay = true) : label(na)
 
 if new_upper_level
     float lvl = use_tip and not na(above_tip_price) ? above_tip_price : high
@@ -187,11 +232,12 @@ if new_upper_level
     array.push(up_lines, line.new(lb, lvl, bar_index, lvl, xloc = xloc.bar_index, color = red, width = 2, force_overlay = true))
     array.push(up_prices, lvl)
     array.push(up_swept, false)
+    array.push(up_labels, mk_label(lvl, red))
     if array.size(up_lines) > max_levels
-        line old = array.shift(up_lines)
-        line.set_color(old, color.new(red, 85))
+        retire_line(array.shift(up_lines), color.new(red, 88))
         array.shift(up_prices)
         array.shift(up_swept)
+        label.delete(array.shift(up_labels))
 
 if new_lower_level
     float lvl = use_tip and not na(below_tip_price) ? below_tip_price : low
@@ -199,11 +245,18 @@ if new_lower_level
     array.push(dn_lines, line.new(lb, lvl, bar_index, lvl, xloc = xloc.bar_index, color = green, width = 2, force_overlay = true))
     array.push(dn_prices, lvl)
     array.push(dn_swept, false)
+    array.push(dn_labels, mk_label(lvl, green))
     if array.size(dn_lines) > max_levels
-        line old = array.shift(dn_lines)
-        line.set_color(old, color.new(green, 85))
+        retire_line(array.shift(dn_lines), color.new(green, 88))
         array.shift(dn_prices)
         array.shift(dn_swept)
+        label.delete(array.shift(dn_labels))
+
+// Sweep the graveyard: delete retired lines past their age limit
+if retire_after > 0
+    while array.size(dead_lines) > 0 and bar_index - array.get(dead_since, 0) > retire_after
+        line.delete(array.shift(dead_lines))
+        array.shift(dead_since)
 
 // ── Signals ──────────────────────────────────────────────
 weakening_bull = osc > 0 and flow_cross_dn
@@ -227,7 +280,13 @@ biasLabel = score >= 2 ? (trendTier == 2 ? "STRONG LONG" : trendTier == 1 ? "LON
 long_active  = score >= 2 and trendTier >= 1
 short_active = score <= -2 and trendTier >= 1
 
-bgcolor(long_active ? bullBg : short_active ? bearBg : na)
+// Debounced background: bias must hold `bias_hold` bars before painting
+var int long_run  = 0
+var int short_run = 0
+long_run  := long_active ? long_run + 1 : 0
+short_run := short_active ? short_run + 1 : 0
+
+bgcolor(long_run >= bias_hold ? bullBg : short_run >= bias_hold ? bearBg : na)
 
 // ── Pane plots (flow oscillator) ─────────────────────────
 main = plot(osc, "Oscillator", color.blue, 2, display = display.none)
@@ -275,38 +334,38 @@ var table t = table.new(table_pos, 2, 8, bgcolor = color.new(color.black, 80), b
 if show_table and barstate.islast
     table.clear(t, 0, 0)
     hdr_bg = color.new(color.gray, 60)
-    table.cell(t, 0, 0, "VN EDGE", text_color = color.white, bgcolor = hdr_bg, text_size = text_size)
+    table.cell(t, 0, 0, "VN EDGE", text_color = chart.fg_color, bgcolor = hdr_bg, text_size = text_size)
     table.cell(t, 1, 0, biasLabel,
-         text_color = score >= 2 ? color.lime : score <= -2 ? color.red : color.yellow,
+         text_color = score >= 2 ? bull_txt : score <= -2 ? bear_txt : neutral_txt,
          bgcolor = hdr_bg, text_size = text_size)
 
-    table.cell(t, 0, 1, "Trend", text_color = color.white, text_size = text_size)
+    table.cell(t, 0, 1, "Trend", text_color = neutral_txt, text_size = text_size)
     table.cell(t, 1, 1, trendDir,
-         text_color = trendTier == 0 ? color.yellow : isBullishDI ? color.lime : color.red, text_size = text_size)
+         text_color = trendTier == 0 ? neutral_txt : isBullishDI ? bull_txt : bear_txt, text_size = text_size)
 
-    table.cell(t, 0, 2, "ADX", text_color = color.white, text_size = text_size)
+    table.cell(t, 0, 2, "ADX", text_color = neutral_txt, text_size = text_size)
     table.cell(t, 1, 2, str.tostring(adx, "#.##") + (trendTier == 2 ? " (strong)" : trendTier == 1 ? " (active)" : " (weak)"),
-         text_color = color.yellow, text_size = text_size)
+         text_color = trendTier == 2 ? (isBullishDI ? bull_txt : bear_txt) : neutral_txt, text_size = text_size)
 
-    table.cell(t, 0, 3, "ADX Slope 1/5", text_color = color.white, text_size = text_size)
+    table.cell(t, 0, 3, "ADX Slope 1/5", text_color = neutral_txt, text_size = text_size)
     table.cell(t, 1, 3, (slope1 > 0 ? "↑" : slope1 < 0 ? "↓" : "→") + " / " + (slope5 > 0 ? "↑" : slope5 < 0 ? "↓" : "→"),
-         text_color = adxImpulse > 0 ? color.lime : adxImpulse < 0 ? color.red : color.yellow, text_size = text_size)
+         text_color = adxImpulse > 0 ? bull_txt : adxImpulse < 0 ? bear_txt : neutral_txt, text_size = text_size)
 
-    table.cell(t, 0, 4, "Trend Impulse", text_color = color.white, text_size = text_size)
+    table.cell(t, 0, 4, "Trend Impulse", text_color = neutral_txt, text_size = text_size)
     table.cell(t, 1, 4, slopeBias,
-         text_color = slopeFading ? color.orange : isBullishDI ? color.lime : color.red, text_size = text_size)
+         text_color = slopeFading ? warn_txt : isBullishDI ? bull_txt : bear_txt, text_size = text_size)
 
-    table.cell(t, 0, 5, "Flow", text_color = color.white, text_size = text_size)
+    table.cell(t, 0, 5, "Flow", text_color = neutral_txt, text_size = text_size)
     table.cell(t, 1, 5, str.tostring(osc, "#.##") + (above_signal ? " > sig" : below_signal ? " < sig" : " = sig"),
-         text_color = osc > 0 ? color.lime : osc < 0 ? color.red : color.yellow, text_size = text_size)
+         text_color = osc > 0 ? bull_txt : osc < 0 ? bear_txt : neutral_txt, text_size = text_size)
 
-    table.cell(t, 0, 6, "DI +/-", text_color = color.white, text_size = text_size)
+    table.cell(t, 0, 6, "DI +/-", text_color = neutral_txt, text_size = text_size)
     table.cell(t, 1, 6, str.tostring(diPlus, "#.#") + " / " + str.tostring(diMinus, "#.#"),
-         text_color = isBullishDI ? color.lime : color.red, text_size = text_size)
+         text_color = isBullishDI ? bull_txt : bear_txt, text_size = text_size)
 
-    table.cell(t, 0, 7, "Levels ↑/↓", text_color = color.white, text_size = text_size)
+    table.cell(t, 0, 7, "Levels ↑/↓", text_color = neutral_txt, text_size = text_size)
     table.cell(t, 1, 7, str.tostring(array.size(up_lines)) + " / " + str.tostring(array.size(dn_lines)),
-         text_color = color.white, text_size = text_size)
+         text_color = neutral_txt, text_size = text_size)
 
 // ── Alerts ───────────────────────────────────────────────
 alertcondition(long_active and not long_active[1],   "VN Edge: LONG Bias On",   "VN Edge | LONG bias active (DI+flow confluence, ADX above trigger) on {{ticker}} {{interval}}")
