@@ -1,0 +1,331 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © VN Edge — derivative work combining and improving:
+//   "Trinity ADX Pro Bias" © EMA34TRAD (MPL-2.0)
+//   "Nadaraya-Watson Regression Liquidity Sweeps [AlgoAlpha]" © AlgoAlpha (MPL-2.0)
+//
+// Improvements over the originals (see CODE_REVIEW.md in this repo):
+//   * ADX/DI via seeded Wilder smoothing (ta.dmi) — no zero-start bias, no na from 0/0
+//   * Strong-trend labels tier on the STRONG level first (the original branch was unreachable)
+//   * Oscillator guarded against zero stdev (flat markets no longer blank the pane)
+//   * Liquidity levels: MULTIPLE levels tracked simultaneously (arrays), each retired explicitly
+//   * Sweep semantics split: WICK SWEEP (liquidity grab) vs CLOSE BREAK (breakout) — separate alerts
+//   * Rebound signals compare close[1] to nw_val[1] (a real cross, not a curve drift)
+//   * Combined VN EDGE BIAS: DI direction + flow sign + flow-vs-signal confluence, graded by ADX tier
+//@version=6
+indicator("VN Edge — Trinity Flow", "VN Edge", overlay = false, max_lines_count = 500)
+
+// ── Inputs ───────────────────────────────────────────────
+g_trend = "Trend Engine (ADX/DI)"
+g_flow  = "Flow Engine (Nadaraya-Watson)"
+g_liq   = "Liquidity Levels"
+g_bias  = "Bias Thresholds"
+g_app   = "Appearance"
+
+adx_len = input.int(14, "ADX & DI Length", minval = 1, group = g_trend)
+th1     = input.int(10, "Trigger Level (trend wakes up)", minval = 1, maxval = 50, group = g_trend)
+th2     = input.int(20, "Strong Trend Level", minval = 1, maxval = 100, group = g_trend)
+
+nw_bandwidth   = input.int(30,  "NW Bandwidth", minval = 1, group = g_flow)
+nw_lookback    = input.int(140, "NW Lookback", minval = 1, group = g_flow)
+norm_len       = input.int(100, "Slope Normalization Length", minval = 2, group = g_flow)
+osc_smooth_len = input.int(21,  "Oscillator Smoothing (WMA)", minval = 1, group = g_flow)
+signal_len     = input.int(14,  "Signal Length (EMA)", minval = 1, group = g_flow)
+atr_len        = input.int(14,  "ATR Length", minval = 1, group = g_flow)
+vol_smooth_len = input.int(21,  "Volatility Smoothing", minval = 1, group = g_flow)
+
+use_tip    = input.bool(true, "Anchor Levels to Swing Points", group = g_liq)
+max_levels = input.int(8, "Max Tracked Levels per Side", minval = 1, maxval = 50, group = g_liq)
+
+bias_build = input.float(0.2,  "ADX Impulse: Building Threshold", step = 0.05, group = g_bias)
+bias_fade  = input.float(-0.3, "ADX Impulse: Fading Threshold", step = 0.05, group = g_bias)
+
+show_band_candles  = input.bool(true, "Show NW Band Candles", group = g_app)
+show_price_candles = input.bool(true, "Show Recolored Price Candles", group = g_app)
+show_signal_line   = input.bool(true, "Show Oscillator Signal Line", group = g_app)
+show_momentum_dots = input.bool(true, "Show Momentum Weakening Dots", group = g_app)
+show_rebounds      = input.bool(true, "Show Rebound Markers", group = g_app)
+show_table         = input.bool(true, "Show VN Edge Table", group = g_app)
+table_pos_str      = input.string("Top Right", "Table Position", options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right", "Middle Left", "Middle Right"], group = g_app)
+table_size_str     = input.string("Small", "Table Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = g_app)
+
+green  = input.color(#00ffbb, "Bullish Colour", group = g_app)
+red    = input.color(#ff1100, "Bearish Colour", group = g_app)
+bullBg = input.color(color.new(color.aqua, 88), "Bullish Background", group = g_app)
+bearBg = input.color(color.new(color.purple, 88), "Bearish Background", group = g_app)
+
+text_size = switch table_size_str
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    => size.large
+
+table_pos = switch table_pos_str
+    "Top Left"     => position.top_left
+    "Top Right"    => position.top_right
+    "Bottom Left"  => position.bottom_left
+    "Bottom Right" => position.bottom_right
+    "Middle Left"  => position.middle_left
+    => position.middle_right
+
+// ── Trend engine: ADX/DI (seeded Wilder via ta.dmi) ──────
+[diPlus, diMinus, adx] = ta.dmi(adx_len, adx_len)
+
+isBullishDI = diPlus > diMinus
+trendTier   = adx > th2 ? 2 : adx > th1 ? 1 : 0
+trendDir    = trendTier == 0 ? "Weak / Choppy" :
+     isBullishDI ? (trendTier == 2 ? "Strong Uptrend" : "Uptrend") :
+     (trendTier == 2 ? "Strong Downtrend" : "Downtrend")
+
+slope1     = adx - adx[1]
+slope5     = adx - adx[5]
+adxImpulse = slope1 * 0.6 + slope5 * 0.4
+
+slopeBias = isBullishDI ?
+     (adxImpulse > bias_build ? "Bull Building" : adxImpulse > 0 ? "Bull Steady" : adxImpulse < bias_fade ? "Bull Fading" : "Bull Flat") :
+     (adxImpulse > bias_build ? "Bear Building" : adxImpulse > 0 ? "Bear Steady" : adxImpulse < bias_fade ? "Bear Fading" : "Bear Flat")
+slopeFading = adxImpulse < bias_fade
+
+// ── Flow engine: causal Nadaraya-Watson slope oscillator ─
+nw(series float src, simple int bandwidth, simple int lookback) =>
+    float num = 0.0
+    float den = 0.0
+    float h2  = 2.0 * bandwidth * bandwidth
+    for i = 0 to lookback - 1
+        float w = math.exp(-(i * i) / h2)
+        num += src[i] * w
+        den += w
+    num / den
+
+pseudo_transp(color c, int transp) =>
+    color.from_gradient(transp, 0, 100, c, chart.bg_color)
+
+nw_val   = nw(close, nw_bandwidth, nw_lookback)
+nw_slope = nw_val - nw_val[1]
+
+slope_std = ta.stdev(nw_slope, norm_len)
+osc_raw   = slope_std == 0 ? 0 : nw_slope / slope_std
+osc       = ta.wma(osc_raw, osc_smooth_len)
+signal    = ta.ema(osc, signal_len)
+
+volatility = ta.sma(ta.atr(atr_len), vol_smooth_len)
+overflow   = math.max(math.abs(osc) - 2, 0)
+
+flow_cross_dn = ta.crossunder(osc, signal)
+flow_cross_up = ta.crossover(osc, signal)
+above_signal  = osc > signal
+below_signal  = osc < signal
+
+// Phase-extreme tracking for level anchoring
+var float above_tip_price = na
+var int   above_tip_bar   = na
+var float below_tip_price = na
+var int   below_tip_bar   = na
+
+if above_signal
+    if not above_signal[1] or na(above_tip_price) or high > above_tip_price
+        above_tip_price := not above_signal[1] ? high : math.max(high, above_tip_price)
+        above_tip_bar   := bar_index
+
+if below_signal
+    if not below_signal[1] or na(below_tip_price) or low < below_tip_price
+        below_tip_price := not below_signal[1] ? low : math.min(low, below_tip_price)
+        below_tip_bar   := bar_index
+
+new_upper_level = osc > 0 and flow_cross_dn
+new_lower_level = osc < 0 and flow_cross_up
+
+// ── Liquidity levels: multi-level tracking with wick/close semantics ─
+var array<line>  up_lines  = array.new<line>()
+var array<float> up_prices = array.new<float>()
+var array<bool>  up_swept  = array.new<bool>()
+var array<line>  dn_lines  = array.new<line>()
+var array<float> dn_prices = array.new<float>()
+var array<bool>  dn_swept  = array.new<bool>()
+
+upper_wick_sweep  = false
+upper_close_break = false
+lower_wick_sweep  = false
+lower_close_break = false
+
+if array.size(up_lines) > 0
+    for i = array.size(up_lines) - 1 to 0
+        line ln = array.get(up_lines, i)
+        float p = array.get(up_prices, i)
+        line.set_x2(ln, bar_index)
+        if close > p
+            upper_close_break := true
+            line.set_style(ln, line.style_dotted)
+            line.set_color(ln, color.new(red, 75))
+            array.remove(up_lines, i)
+            array.remove(up_prices, i)
+            array.remove(up_swept, i)
+        else if high > p and not array.get(up_swept, i)
+            upper_wick_sweep := true
+            array.set(up_swept, i, true)
+            line.set_style(ln, line.style_dashed)
+
+if array.size(dn_lines) > 0
+    for i = array.size(dn_lines) - 1 to 0
+        line ln = array.get(dn_lines, i)
+        float p = array.get(dn_prices, i)
+        line.set_x2(ln, bar_index)
+        if close < p
+            lower_close_break := true
+            line.set_style(ln, line.style_dotted)
+            line.set_color(ln, color.new(green, 75))
+            array.remove(dn_lines, i)
+            array.remove(dn_prices, i)
+            array.remove(dn_swept, i)
+        else if low < p and not array.get(dn_swept, i)
+            lower_wick_sweep := true
+            array.set(dn_swept, i, true)
+            line.set_style(ln, line.style_dashed)
+
+if new_upper_level
+    float lvl = use_tip and not na(above_tip_price) ? above_tip_price : high
+    int   lb  = use_tip and not na(above_tip_bar) ? above_tip_bar : bar_index
+    array.push(up_lines, line.new(lb, lvl, bar_index, lvl, xloc = xloc.bar_index, color = red, width = 2, force_overlay = true))
+    array.push(up_prices, lvl)
+    array.push(up_swept, false)
+    if array.size(up_lines) > max_levels
+        line old = array.shift(up_lines)
+        line.set_color(old, color.new(red, 85))
+        array.shift(up_prices)
+        array.shift(up_swept)
+
+if new_lower_level
+    float lvl = use_tip and not na(below_tip_price) ? below_tip_price : low
+    int   lb  = use_tip and not na(below_tip_bar) ? below_tip_bar : bar_index
+    array.push(dn_lines, line.new(lb, lvl, bar_index, lvl, xloc = xloc.bar_index, color = green, width = 2, force_overlay = true))
+    array.push(dn_prices, lvl)
+    array.push(dn_swept, false)
+    if array.size(dn_lines) > max_levels
+        line old = array.shift(dn_lines)
+        line.set_color(old, color.new(green, 85))
+        array.shift(dn_prices)
+        array.shift(dn_swept)
+
+// ── Signals ──────────────────────────────────────────────
+weakening_bull = osc > 0 and flow_cross_dn
+weakening_bear = osc < 0 and flow_cross_up
+zero_cross_up  = ta.crossover(osc, 0)
+zero_cross_dn  = ta.crossunder(osc, 0)
+// Real curve cross: prior close vs prior curve value, current close vs current
+bullish_rebound = osc > 0 and close[1] < nw_val[1] and close > nw_val
+bearish_rebound = osc < 0 and close[1] > nw_val[1] and close < nw_val
+
+// ── VN EDGE combined bias ────────────────────────────────
+di_dir   = isBullishDI ? 1 : -1
+osc_dir  = osc > 0 ? 1 : osc < 0 ? -1 : 0
+flow_dir = above_signal ? 1 : below_signal ? -1 : 0
+score    = di_dir + osc_dir + flow_dir
+
+biasLabel = score >= 2 ? (trendTier == 2 ? "STRONG LONG" : trendTier == 1 ? "LONG" : "LONG (weak trend)") :
+     score <= -2 ? (trendTier == 2 ? "STRONG SHORT" : trendTier == 1 ? "SHORT" : "SHORT (weak trend)") :
+     score == 1 ? "LEAN LONG" : score == -1 ? "LEAN SHORT" : "NEUTRAL"
+
+long_active  = score >= 2 and trendTier >= 1
+short_active = score <= -2 and trendTier >= 1
+
+bgcolor(long_active ? bullBg : short_active ? bearBg : na)
+
+// ── Pane plots (flow oscillator) ─────────────────────────
+main = plot(osc, "Oscillator", color.blue, 2, display = display.none)
+plot(signal, "Signal Line", show_signal_line ? color.new(chart.fg_color, 50) : na)
+ovf  = plot(osc > 2 ? overflow : osc < -2 ? -overflow : 0, "Overflow", display = display.none)
+zero = plot(0, "Zero Line", chart.fg_color)
+
+col_ = osc > 0 ?
+     color.from_gradient(osc, 0, 3, pseudo_transp(green, 80), pseudo_transp(green, 30)) :
+     color.from_gradient(osc, -3, 0, pseudo_transp(red, 30), pseudo_transp(red, 80))
+
+fill(main, ovf, col_, "Oscillator Gradient")
+fill(zero, ovf, osc > 0 ? green : red, "Overflow Fill")
+
+// Hidden data plots (data window / external alerts)
+plot(diPlus,  "+DI", display = display.none)
+plot(diMinus, "-DI", display = display.none)
+plot(adx,     "ADX", display = display.none)
+plot(score,   "VN Edge Score", display = display.none)
+
+// ── Price-pane overlays ──────────────────────────────────
+plotcandle(
+     open  = show_band_candles ? nw_val + (osc > 0 ? -volatility : volatility) : na,
+     high  = show_band_candles ? (osc < 0 ? high : nw_val) : na,
+     low   = show_band_candles ? (osc > 0 ? low : nw_val) : na,
+     close = show_band_candles ? nw_val : na,
+     title = "NW Band", bordercolor = na, color = col_,
+     wickcolor = color.new(col_, 70), force_overlay = true)
+
+plotcandle(
+     open  = show_price_candles ? open : na,
+     high  = show_price_candles ? high : na,
+     low   = show_price_candles ? low : na,
+     close = show_price_candles ? close : na,
+     title = "Price", color = col_, wickcolor = col_, bordercolor = col_, force_overlay = true)
+
+plotchar(show_momentum_dots and weakening_bull, "Weakening Bullish Momentum", "●", location.abovebar, green, size = size.tiny, force_overlay = true)
+plotchar(show_momentum_dots and weakening_bear, "Weakening Bearish Momentum", "●", location.belowbar, red, size = size.tiny, force_overlay = true)
+plotchar(show_rebounds and bullish_rebound ? nw_val - volatility * 1.5 : na, "Bullish Rebound", "▲", location.absolute, green, size = size.tiny, force_overlay = true)
+plotchar(show_rebounds and bearish_rebound ? nw_val + volatility * 1.5 : na, "Bearish Rebound", "▼", location.absolute, red, size = size.tiny, force_overlay = true)
+
+// ── VN Edge table ────────────────────────────────────────
+var table t = table.new(table_pos, 2, 8, bgcolor = color.new(color.black, 80), border_width = 1)
+
+if show_table and barstate.islast
+    table.clear(t, 0, 0)
+    hdr_bg = color.new(color.gray, 60)
+    table.cell(t, 0, 0, "VN EDGE", text_color = color.white, bgcolor = hdr_bg, text_size = text_size)
+    table.cell(t, 1, 0, biasLabel,
+         text_color = score >= 2 ? color.lime : score <= -2 ? color.red : color.yellow,
+         bgcolor = hdr_bg, text_size = text_size)
+
+    table.cell(t, 0, 1, "Trend", text_color = color.white, text_size = text_size)
+    table.cell(t, 1, 1, trendDir,
+         text_color = trendTier == 0 ? color.yellow : isBullishDI ? color.lime : color.red, text_size = text_size)
+
+    table.cell(t, 0, 2, "ADX", text_color = color.white, text_size = text_size)
+    table.cell(t, 1, 2, str.tostring(adx, "#.##") + (trendTier == 2 ? " (strong)" : trendTier == 1 ? " (active)" : " (weak)"),
+         text_color = color.yellow, text_size = text_size)
+
+    table.cell(t, 0, 3, "ADX Slope 1/5", text_color = color.white, text_size = text_size)
+    table.cell(t, 1, 3, (slope1 > 0 ? "↑" : slope1 < 0 ? "↓" : "→") + " / " + (slope5 > 0 ? "↑" : slope5 < 0 ? "↓" : "→"),
+         text_color = adxImpulse > 0 ? color.lime : adxImpulse < 0 ? color.red : color.yellow, text_size = text_size)
+
+    table.cell(t, 0, 4, "Trend Impulse", text_color = color.white, text_size = text_size)
+    table.cell(t, 1, 4, slopeBias,
+         text_color = slopeFading ? color.orange : isBullishDI ? color.lime : color.red, text_size = text_size)
+
+    table.cell(t, 0, 5, "Flow", text_color = color.white, text_size = text_size)
+    table.cell(t, 1, 5, str.tostring(osc, "#.##") + (above_signal ? " > sig" : below_signal ? " < sig" : " = sig"),
+         text_color = osc > 0 ? color.lime : osc < 0 ? color.red : color.yellow, text_size = text_size)
+
+    table.cell(t, 0, 6, "DI +/-", text_color = color.white, text_size = text_size)
+    table.cell(t, 1, 6, str.tostring(diPlus, "#.#") + " / " + str.tostring(diMinus, "#.#"),
+         text_color = isBullishDI ? color.lime : color.red, text_size = text_size)
+
+    table.cell(t, 0, 7, "Levels ↑/↓", text_color = color.white, text_size = text_size)
+    table.cell(t, 1, 7, str.tostring(array.size(up_lines)) + " / " + str.tostring(array.size(dn_lines)),
+         text_color = color.white, text_size = text_size)
+
+// ── Alerts ───────────────────────────────────────────────
+alertcondition(long_active and not long_active[1],   "VN Edge: LONG Bias On",   "VN Edge | LONG bias active (DI+flow confluence, ADX above trigger) on {{ticker}} {{interval}}")
+alertcondition(short_active and not short_active[1], "VN Edge: SHORT Bias On",  "VN Edge | SHORT bias active (DI+flow confluence, ADX above trigger) on {{ticker}} {{interval}}")
+alertcondition((long_active[1] or short_active[1]) and not (long_active or short_active), "VN Edge: Bias Off", "VN Edge | Bias deactivated on {{ticker}} {{interval}}")
+
+alertcondition(adx > th2 and adx[1] <= th2, "ADX Strong Cross Up",   "VN Edge | ADX crossed above strong level on {{ticker}} {{interval}}")
+alertcondition(adx < th2 and adx[1] >= th2, "ADX Strong Cross Down", "VN Edge | ADX fell below strong level on {{ticker}} {{interval}}")
+alertcondition(ta.crossover(diPlus, diMinus),  "+DI Cross Above -DI", "VN Edge | +DI crossed above -DI on {{ticker}} {{interval}}")
+alertcondition(ta.crossover(diMinus, diPlus),  "-DI Cross Above +DI", "VN Edge | -DI crossed above +DI on {{ticker}} {{interval}}")
+
+alertcondition(weakening_bull, "Weakening Bullish Momentum", "VN Edge | Bullish momentum weakening on {{ticker}} {{interval}}")
+alertcondition(weakening_bear, "Weakening Bearish Momentum", "VN Edge | Bearish momentum weakening on {{ticker}} {{interval}}")
+alertcondition(zero_cross_up,  "Flow Zero Cross Up",   "VN Edge | Flow oscillator crossed above zero on {{ticker}} {{interval}}")
+alertcondition(zero_cross_dn,  "Flow Zero Cross Down", "VN Edge | Flow oscillator crossed below zero on {{ticker}} {{interval}}")
+
+alertcondition(new_upper_level, "New Upper Liquidity Level", "VN Edge | New upper liquidity level on {{ticker}} {{interval}}")
+alertcondition(new_lower_level, "New Lower Liquidity Level", "VN Edge | New lower liquidity level on {{ticker}} {{interval}}")
+alertcondition(upper_wick_sweep,  "Upper Level WICK Sweep",  "VN Edge | Upper level swept by wick (liquidity grab) on {{ticker}} {{interval}}")
+alertcondition(lower_wick_sweep,  "Lower Level WICK Sweep",  "VN Edge | Lower level swept by wick (liquidity grab) on {{ticker}} {{interval}}")
+alertcondition(upper_close_break, "Upper Level CLOSE Break", "VN Edge | Upper level broken by close (breakout) on {{ticker}} {{interval}}")
+alertcondition(lower_close_break, "Lower Level CLOSE Break", "VN Edge | Lower level broken by close (breakout) on {{ticker}} {{interval}}")
