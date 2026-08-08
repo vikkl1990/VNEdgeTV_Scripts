@@ -42,6 +42,7 @@ vol_smooth_len = input.int(21,  "Volatility Smoothing", minval = 1, group = g_fl
 use_tip      = input.bool(true, "Anchor Levels to Swing Points", group = g_liq)
 max_levels   = input.int(8, "Max Tracked Levels per Side", minval = 1, maxval = 50, group = g_liq)
 retire_after = input.int(60, "Delete Retired Levels After (bars, 0 = keep)", minval = 0, group = g_liq, tooltip = "A level broken by a close (or evicted by the cap) fades immediately and is deleted this many bars later, so old lines stop striping the chart. 0 keeps faded lines forever.")
+max_dist_atr = input.float(8, "Retire Levels Beyond (ATR multiples, 0 = off)", minval = 0, step = 0.5, group = g_liq, tooltip = "An active level farther than this many smoothed ATRs from the current close is retired as no longer actionable. Keeps far-away lines from stretching the chart's auto-scale and squashing the candles. Tip: also enable the chart's 'Scale price chart only' option.")
 show_labels  = input.bool(true, "Price Labels on Active Levels", group = g_liq)
 
 bias_build = input.float(0.2,  "ADX Impulse: Building Threshold", step = 0.05, group = g_bias)
@@ -179,8 +180,9 @@ if array.size(up_lines) > 0
         line ln = array.get(up_lines, i)
         float p = array.get(up_prices, i)
         line.set_x2(ln, bar_index)
-        if close > p
-            upper_close_break := true
+        bool too_far_up = max_dist_atr > 0 and not na(volatility) and (p - close) > max_dist_atr * volatility
+        if close > p or too_far_up
+            upper_close_break := upper_close_break or close > p
             retire_line(ln, color.new(red, 80))
             label.delete(array.get(up_labels, i))
             array.remove(up_lines, i)
@@ -197,8 +199,9 @@ if array.size(dn_lines) > 0
         line ln = array.get(dn_lines, i)
         float p = array.get(dn_prices, i)
         line.set_x2(ln, bar_index)
-        if close < p
-            lower_close_break := true
+        bool too_far_dn = max_dist_atr > 0 and not na(volatility) and (close - p) > max_dist_atr * volatility
+        if close < p or too_far_dn
+            lower_close_break := lower_close_break or close < p
             retire_line(ln, color.new(green, 80))
             label.delete(array.get(dn_labels, i))
             array.remove(dn_lines, i)
